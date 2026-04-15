@@ -41,7 +41,7 @@ def run_demo(
     model_path: str = "ppo_college_floor.zip",
     density_weights: str = "density_head.pth",
     simulate: bool = False,
-    num_zones: int = 3,
+    num_zones: int = 1,
     target_fps: float = 2.0,
 ) -> None:
     """
@@ -66,7 +66,7 @@ def run_demo(
     # 1. Load PPO model
     # ------------------------------------------------------------------
     from stable_baselines3 import PPO
-    from rl_environment.env import CollegeFloorEnv
+    from rl_environment.env import CollegeFloorEnv, ROOM_ORDER, ROOM_CONFIGS
 
     print("Loading PPO model ...")
     try:
@@ -89,6 +89,7 @@ def run_demo(
     # ------------------------------------------------------------------
     pipeline = None
     cap = None
+    using_camera = False
 
     if not simulate:
         try:
@@ -115,6 +116,7 @@ def run_demo(
             print("    Falling back to simulation mode.")
             simulate = True
         else:
+            using_camera = True
             print(f"  [OK] Video source opened: {source}")
 
     # ------------------------------------------------------------------
@@ -146,6 +148,7 @@ def run_demo(
             loop_start = time.time()
 
             # --- Read frame (if camera mode) ---
+            camera_data = None
             if not simulate and cap is not None:
                 ret, frame = cap.read()
                 if not ret:
@@ -160,21 +163,22 @@ def run_demo(
                     # Run DL pipeline
                     density_map, zone_occ, zone_activity = pipeline(frame)
 
-                    # Normalise zone occupancy to [0, 1] range
-                    # (raw sums can be large; scale by room capacity proxy)
-                    max_expected = density_map.shape[0] * density_map.shape[1] / num_zones * 0.5
-                    zone_occ_norm = np.clip(zone_occ / max(max_expected, 1.0), 0.0, 1.0)
-                    zone_act_norm = zone_activity / 2.0  # {0,1,2} -> {0, 0.5, 1}
+                    # --- Post-processing for single-room indoor use ---
+                    raw_count = zone_occ.sum()
 
-                    # Inject into environment
-                    CollegeFloorEnv.from_dl_output(env, zone_occ_norm, zone_act_norm)
+                    # Threshold: suppress low-confidence density noise
+                    NOISE_FLOOR = 5.0
+                    cleaned_count = max(raw_count - NOISE_FLOOR, 0.0)
 
-                    # Show camera feed with overlay
-                    from dl_pipeline.model import visualize_density
-                    overlay = visualize_density(frame, density_map, zone_occ, num_zones)
-                    cv2.imshow("Camera - Density Overlay", overlay)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+                    # Cap at room capacity and normalise to [0, 1]
+                    ROOM_CAPACITY = 60.0
+                    occ_norm = np.clip(cleaned_count / ROOM_CAPACITY, 0.0, 1.0)
+
+                    zone_occ_norm = np.array([occ_norm], dtype=np.float32)
+                    zone_act_norm = zone_activity[:1] / 2.0
+
+                    # Store — will inject AFTER env.step()
+                    camera_data = (zone_occ_norm, zone_act_norm, raw_count, cleaned_count, occ_norm)
 
             # --- Get action ---
             if ppo_model is not None:
@@ -182,11 +186,67 @@ def run_demo(
             else:
                 action, _ = fallback_policy.predict(obs)
 
-            # --- Step environment ---
+            # --- Step environment (updates all rooms with simulation) ---
             obs, reward, terminated, truncated, info = env.step(action)
 
+            # --- Override Room 102 with CAMERA data (after step!) ---
+            if camera_data is not None:
+                zone_occ_norm, zone_act_norm, raw_count, cleaned_count, occ_norm = camera_data
+                CollegeFloorEnv.from_dl_output(
+                    env, zone_occ_norm, zone_act_norm,
+                    zone_room_mapping={0: "102"},
+                )
+                print(f"  [CAM -> Room 102] Raw={raw_count:.0f}  Cleaned={cleaned_count:.0f}  Occ={occ_norm:.0%}", end="\r")
+
+            # --- Comfort override: enforce minimum device levels ---
+            # The PPO agent optimises aggressively for energy savings.
+            # In real buildings, occupied rooms MUST have basic comfort.
+            # This override ensures devices respond visibly to occupancy.
+            for room_id in ROOM_ORDER:
+                occ = env.occupancy[room_id]
+                cfg = ROOM_CONFIGS[room_id]
+                levels = env.device_levels[room_id]
+
+                if occ > 0.6:      # high occupancy -> full
+                    if cfg["has_light"]:
+                        levels["light"] = max(levels["light"], 1.0)
+                    if cfg["has_fan"]:
+                        levels["fan"] = max(levels["fan"], 1.0)
+                    if cfg["has_ac"]:
+                        levels["ac"] = max(levels["ac"], 1.0)
+                elif occ > 0.25:   # moderate -> half
+                    if cfg["has_light"]:
+                        levels["light"] = max(levels["light"], 0.5)
+                    if cfg["has_fan"]:
+                        levels["fan"] = max(levels["fan"], 0.5)
+                    if cfg["has_ac"]:
+                        levels["ac"] = max(levels["ac"], 0.5)
+                # else: low/empty -> agent's choice (may be 0 = off)
+
+            # --- Recompute energy with actual (overridden) device levels ---
+            # env.step() computed energy BEFORE the comfort override,
+            # so we recalculate to get accurate numbers.
+            actual_energy = sum(env._compute_room_energy(r) for r in ROOM_ORDER)
+            actual_energy += env._compute_corridor_energy()
+            actual_cost = actual_energy * env.cost_per_kwh
+
+            # Fix the cumulative trackers (undo step's calculation, add ours)
+            old_energy = info["total_energy_kwh"]
+            energy_diff = actual_energy - old_energy
+            env.total_energy_kwh += energy_diff
+            env.total_cost_rupees += energy_diff * env.cost_per_kwh
+
+            # Update info dict for the dashboard
+            info["total_energy_kwh"] = actual_energy
+            info["total_cost_rupees"] = actual_cost
+            info["cumulative_energy_kwh"] = env.total_energy_kwh
+            info["cumulative_cost_rupees"] = env.total_cost_rupees
+
             # --- Update dashboard ---
-            dashboard.update(info)
+            try:
+                dashboard.update(info)
+            except Exception:
+                pass  # suppress Tkinter rendering glitches on fast video
 
             step_count += 1
 
@@ -267,8 +327,8 @@ def main():
         help="Run in simulation-only mode (no camera).",
     )
     parser.add_argument(
-        "--num_zones", type=int, default=3,
-        help="Number of horizontal zones.",
+        "--num_zones", type=int, default=1,
+        help="Number of horizontal zones (1 = whole camera → Room 102).",
     )
     parser.add_argument(
         "--fps", type=float, default=2.0,

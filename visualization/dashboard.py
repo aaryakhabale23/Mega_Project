@@ -16,7 +16,7 @@ Usage
 from __future__ import annotations
 
 import matplotlib
-matplotlib.use("TkAgg")  # or "Agg" for non-interactive / Colab
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
