@@ -139,6 +139,12 @@ def run_demo(
     start_time = time.time()
     step_count = 0
 
+    # Auto-calibration: learn the noise floor from the first few frames
+    CALIBRATION_FRAMES = 5
+    calibration_counts = []
+    noise_floor = 0.0
+    calibrated = False
+
     print("=" * 60)
     print("  DEMO RUNNING  |  Press Ctrl+C to stop")
     print("=" * 60)
@@ -163,12 +169,21 @@ def run_demo(
                     # Run DL pipeline
                     density_map, zone_occ, zone_activity = pipeline(frame)
 
-                    # --- Post-processing for single-room indoor use ---
+                    # --- Auto-calibrated noise removal ---
                     raw_count = zone_occ.sum()
 
-                    # Threshold: suppress low-confidence density noise
-                    NOISE_FLOOR = 5.0
-                    cleaned_count = max(raw_count - NOISE_FLOOR, 0.0)
+                    if not calibrated:
+                        # Collect baseline samples from first frames
+                        calibration_counts.append(raw_count)
+                        if len(calibration_counts) >= CALIBRATION_FRAMES:
+                            # Use minimum of first frames as baseline
+                            # (the scene with least "phantom" density)
+                            noise_floor = min(calibration_counts) * 0.9
+                            calibrated = True
+                            print(f"  [CALIBRATED] noise_floor={noise_floor:.1f} "
+                                  f"(from {CALIBRATION_FRAMES} frames)")
+
+                    cleaned_count = max(raw_count - noise_floor, 0.0)
 
                     # Cap at room capacity and normalise to [0, 1]
                     ROOM_CAPACITY = 60.0
@@ -207,21 +222,26 @@ def run_demo(
                 cfg = ROOM_CONFIGS[room_id]
                 levels = env.device_levels[room_id]
 
-                if occ > 0.6:      # high occupancy -> full
+                if occ > 0.6:      # high occupancy -> full power
                     if cfg["has_light"]:
                         levels["light"] = max(levels["light"], 1.0)
                     if cfg["has_fan"]:
                         levels["fan"] = max(levels["fan"], 1.0)
                     if cfg["has_ac"]:
                         levels["ac"] = max(levels["ac"], 1.0)
-                elif occ > 0.25:   # moderate -> half
+                elif occ > 0.25:   # moderate -> half power
                     if cfg["has_light"]:
                         levels["light"] = max(levels["light"], 0.5)
                     if cfg["has_fan"]:
                         levels["fan"] = max(levels["fan"], 0.5)
                     if cfg["has_ac"]:
                         levels["ac"] = max(levels["ac"], 0.5)
-                # else: low/empty -> agent's choice (may be 0 = off)
+                elif occ > 0.05:   # low but occupied -> lights + fan on minimum
+                    if cfg["has_light"]:
+                        levels["light"] = max(levels["light"], 0.5)
+                    if cfg["has_fan"]:
+                        levels["fan"] = max(levels["fan"], 0.5)
+                # else: truly empty -> everything off (saves energy)
 
             # --- Recompute energy with actual (overridden) device levels ---
             # env.step() computed energy BEFORE the comfort override,
